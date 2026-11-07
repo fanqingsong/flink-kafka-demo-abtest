@@ -1,5 +1,7 @@
 package org.example.ab;
 
+import org.example.ab.attribution.AttributionRules;
+import org.example.ab.attribution.ExposureState;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -13,23 +15,21 @@ class EventAnalyticsJobTest {
 
     @Test
     void attributesOnlyMatchingVariantInsideWindow() {
-        EventAnalyticsJob.ExposureState exposure =
-                new EventAnalyticsJob.ExposureState(1_000L, "variant-a");
+        ExposureState exposure = new ExposureState(1_000L, "variant-a");
 
-        assertTrue(EventAnalyticsJob.isWithinAttribution(exposure, "variant-a", 2_000L, WINDOW));
-        assertFalse(EventAnalyticsJob.isWithinAttribution(exposure, "variant-b", 2_000L, WINDOW));
-        assertFalse(EventAnalyticsJob.isWithinAttribution(exposure, "variant-a", 999L, WINDOW));
-        assertFalse(EventAnalyticsJob.isWithinAttribution(
+        assertTrue(AttributionRules.isWithinAttribution(exposure, "variant-a", 2_000L, WINDOW));
+        assertFalse(AttributionRules.isWithinAttribution(exposure, "variant-b", 2_000L, WINDOW));
+        assertFalse(AttributionRules.isWithinAttribution(exposure, "variant-a", 999L, WINDOW));
+        assertFalse(AttributionRules.isWithinAttribution(
                 exposure, "variant-a", 1_000L + WINDOW + 1, WINDOW));
     }
 
     @Test
     void marksOnlyFirstExposureWithinAttributionWindow() {
-        assertTrue(EventAnalyticsJob.isFirstExposure(null, 1_000L, WINDOW));
-        EventAnalyticsJob.ExposureState exposure =
-                new EventAnalyticsJob.ExposureState(1_000L, "variant-a");
-        assertFalse(EventAnalyticsJob.isFirstExposure(exposure, 2_000L, WINDOW));
-        assertTrue(EventAnalyticsJob.isFirstExposure(
+        assertTrue(AttributionRules.isFirstExposure(null, 1_000L, WINDOW));
+        ExposureState exposure = new ExposureState(1_000L, "variant-a");
+        assertFalse(AttributionRules.isFirstExposure(exposure, 2_000L, WINDOW));
+        assertTrue(AttributionRules.isFirstExposure(
                 exposure, 1_000L + WINDOW + 1, WINDOW));
     }
 }

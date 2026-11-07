@@ -1,380 +1,241 @@
 package org.example.ab;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.functions.FilterFunction;
-import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.serialization.SerializationSchema;
-import org.apache.flink.api.common.state.StateTtlConfig;
-import org.apache.flink.api.common.state.ValueState;
-import org.apache.flink.api.common.state.ValueStateDescriptor;
-import org.apache.flink.api.common.time.Time;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.base.DeliveryGuarantee;
-import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
-import org.apache.flink.connector.kafka.sink.KafkaSink;
-import org.apache.flink.connector.kafka.source.KafkaSource;
-import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
-import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
-import org.apache.flink.streaming.api.functions.ProcessFunction;
-import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
-import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
-import org.apache.flink.util.Collector;
-import org.apache.flink.util.OutputTag;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.example.ab.config.CheckpointSetup;
+import org.example.ab.config.JobSettings;
+import org.example.ab.kafka.KafkaIO;
+import org.example.ab.operator.AttributionFunction;
+import org.example.ab.operator.DeduplicateFunction;
+import org.example.ab.operator.MetricWindowFunction;
+import org.example.ab.operator.ParseEventFunction;
+import org.example.ab.serde.MetricResultSerializer;
+import org.example.ab.serde.TrackingEventSerializer;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.Serializable;
-import java.math.BigDecimal;
 import java.time.Duration;
-import java.time.Instant;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
 import java.util.Properties;
-import java.util.Set;
-import java.util.UUID;
 
+/**
+ * A/B 埋点实时作业。这个类只把算子串起来，每一步的规则在对应类里。
+ *
+ * <p>下面用同一个人、同一个实验走完一条链路。用户 {@code u1}，实验 {@code exp}，版本 {@code A} 和 {@code B}。
+ *
+ * <pre>
+ *  ab.events.raw
+ *        │
+ *        ▼
+ *     解析 JSON
+ *        ├─ 失败 ─────────────────────────────► ab.events.dlq
+ *        ▼ 成功
+ *     用 event_time 标水位（允许晚 30 秒）
+ *        ▼
+ *     按 event_id 去重（24 小时内只留第一条）
+ *        ▼
+ *     按 u1|exp 归因，打上 attributed
+ *        ├─ 每条都写，含 attributed = 0 ─────► ab.events.valid
+ *        ▼ 只留 attributed = 1
+ *     按 exp|A、exp|B 切成 1 分钟
+ *        └──────────────────────────────────► ab.metrics.1m
+ * </pre>
+ *
+ * 到达顺序是这 6 条：
+ *
+ * <pre>
+ *  #   event_id   name      event_time   variant   amount   这条是什么
+ *  1   e1         exposure  10:00:00     A         -        第一次看到版本 A
+ *  2   e1         exposure  10:00:00     A         -        同一条又上报了一次
+ *  3   {坏 JSON}                                      缺 event_id
+ *  4   e2         click     10:00:40     A         -        曝光后 40 秒，仍是版本 A
+ *  5   e3         click     10:00:50     B         -        点的是另一个版本
+ *  6   e4         purchase  10:01:10     A         19.9     下一分钟的购买
+ * </pre>
+ *
+ * 三条输出里实际留下：
+ *
+ * <pre>
+ *  ab.events.dlq
+ *        #3    raw 原文 + error + failed_at
+ *
+ *  ab.events.valid
+ *        #1    attributed = 1     窗口内第一次曝光
+ *        #4    attributed = 1     曝光之后、同一版本、7 天以内
+ *        #5    attributed = 0     版本不是这次曝光的 A
+ *        #6    attributed = 1     同一版本上的购买
+ *        #2 被去重丢掉，这里没有它
+ *
+ *  ab.metrics.1m          只计 attributed = 1，按 event_time 落进哪一分钟
+ *        [10:00, 10:01)  版本 A    exposure = 1    click = 1
+ *        [10:01, 10:02)  版本 A    purchase = 1    revenue = 19.9
+ *        版本 B 没有已归因事件，所以没有这一行
+ * </pre>
+ *
+ * 水位只决定分钟窗口收不收这条事件，valid 照常写。先处理一条 {@code event_time = 10:01:00} 的事件后，
+ * 水位停在 {@code 10:00:30}。之后才到的 {@code 10:00:40} 仍进入 {@code [10:00, 10:01)}；
+ * 之后才到的 {@code 10:00:20} 已经晚于水位，不会出现在任何分钟桶里。
+ */
 public class EventAnalyticsJob {
 
-    private static final Set<String> EVENT_NAMES = Set.of("exposure", "click", "purchase");
-    private static final DateTimeFormatter CLICKHOUSE_TIME =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS").withZone(ZoneOffset.UTC);
-    private static final OutputTag<String> DLQ = new OutputTag<String>("ab-events-dlq") { };
+    /** 曝光之后，同一版本上的点击和购买在这个时间内才算归因成功。 */
+    private static final Duration ATTRIBUTION_WINDOW = Duration.ofDays(7);
+
+    /** 这个时间内到达的乱序事件仍计入当前窗口。 */
+    private static final Duration OUT_OF_ORDERNESS = Duration.ofSeconds(30);
+    
+    /** 分区这么久没有新数据就标成空闲，避免它拖住其它分区的水位。 */
+    private static final Duration SOURCE_IDLE_TIMEOUT = Duration.ofMinutes(1);
 
     public static void main(String[] args) throws Exception {
-        Properties properties = loadProperties();
+        Properties properties = JobSettings.load();
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.enableCheckpointing(30_000);
-        env.getCheckpointConfig().setCheckpointingMode(
-                org.apache.flink.streaming.api.CheckpointingMode.EXACTLY_ONCE);
-        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(10_000);
-        env.getCheckpointConfig().setCheckpointTimeout(60_000);
-        env.getCheckpointConfig().setExternalizedCheckpointCleanup(
-                CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+        CheckpointSetup.enable(env);
 
-        KafkaSource<String> source = KafkaSource.<String>builder()
-                .setBootstrapServers(properties.getProperty("BOOTSTRAP_SERVERS"))
-                .setTopics(properties.getProperty("AB_EVENTS_RAW_TOPIC"))
-                .setGroupId("flink-ab-event-analytics-v1")
-                .setStartingOffsets(OffsetsInitializer.earliest())
-                .setValueOnlyDeserializer(new SimpleStringSchema())
-                .build();
+        SingleOutputStreamOperator<TrackingEvent> parsed = parseRawEvents(env, properties);
+        writeInvalidEvents(parsed, properties);
 
-        SingleOutputStreamOperator<TrackingEvent> parsed = env
-                .fromSource(source, WatermarkStrategy.noWatermarks(), "AB Raw Events")
-                .process(new ParseEventFunction());
-
-        SingleOutputStreamOperator<TrackingEvent> timed = parsed
-                .assignTimestampsAndWatermarks(
-                        WatermarkStrategy.<TrackingEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
-                                .withTimestampAssigner((event, previous) -> event.getEventTimestamp())
-                                .withIdleness(Duration.ofMinutes(1))
-                );
-
-        SingleOutputStreamOperator<TrackingEvent> deduplicated = timed
-                .keyBy(TrackingEvent::getEventId)
-                .process(new DeduplicateFunction());
-
-        SingleOutputStreamOperator<TrackingEvent> attributed = deduplicated
-                .keyBy(event -> event.getUserId() + "|" + event.getExperimentId())
-                .process(new AttributionFunction(Duration.ofDays(7).toMillis()));
-
-        attributed.sinkTo(eventSink(
-                properties,
-                properties.getProperty("AB_EVENTS_VALID_TOPIC"),
-                "ab-valid-",
-                new TrackingEventSerializationSchema()
-        )).name("Valid Events");
-
-        parsed.getSideOutput(DLQ).sinkTo(eventSink(
-                properties,
-                properties.getProperty("AB_EVENTS_DLQ_TOPIC"),
-                "ab-dlq-",
-                new SimpleStringSchema()
-        )).name("Invalid Events");
-
-        DataStream<MetricResult> metrics = attributed
-                .filter((FilterFunction<TrackingEvent>) event -> event.getAttributed() == 1)
-                .keyBy(event -> event.getExperimentId() + "|" + event.getVariantId())
-                .window(TumblingEventTimeWindows.of(
-                        org.apache.flink.streaming.api.windowing.time.Time.minutes(1)))
-                .process(new MetricWindowFunction());
-
-        metrics.sinkTo(eventSink(
-                properties,
-                properties.getProperty("AB_METRICS_TOPIC"),
-                "ab-metrics-",
-                new MetricSerializationSchema()
-        )).name("Minute Metrics");
+        SingleOutputStreamOperator<TrackingEvent> attributed = attribute(deduplicate(assignEventTime(parsed)));
+        writeValidEvents(attributed, properties);
+        writeMinuteMetrics(attributed, properties);
 
         env.execute("Flink AB Event Analytics");
     }
 
-    private static Properties loadProperties() {
-        Properties properties = new Properties();
-        try (InputStream input = EventAnalyticsJob.class.getClassLoader()
-                .getResourceAsStream("config.properties")) {
-            if (input == null) {
-                throw new IllegalStateException("config.properties not found");
-            }
-            properties.load(input);
-        } catch (IOException ex) {
-            throw new IllegalStateException("cannot load config.properties", ex);
-        }
-        String bootstrap = System.getenv("BOOTSTRAP_SERVERS");
-        if (bootstrap != null && !bootstrap.isBlank()) {
-            properties.setProperty("BOOTSTRAP_SERVERS", bootstrap);
-        }
-        return properties;
+    /**
+     * 读 {@code ab.events.raw}，把 JSON 转成事件。
+     *
+     * <pre>
+     *  #1 #4 #5 #6  → 主流，继续去重和归因
+     *  #3 坏 JSON   → 侧输出，交给 writeInvalidEvents
+     * </pre>
+     */
+    private static SingleOutputStreamOperator<TrackingEvent> parseRawEvents(
+            StreamExecutionEnvironment env, Properties properties) {
+        return env.fromSource(
+                        KafkaIO.rawEvents(properties),
+                        WatermarkStrategy.noWatermarks(),
+                        "AB Raw Events")
+                .process(new ParseEventFunction());
     }
 
-    private static <T> KafkaSink<T> eventSink(
+    /**
+     * 窗口时间用客户端的 {@code event_time}，不用这条消息到达 Flink 的时间。
+     *
+     * <pre>
+     *  先到 event_time = 10:01:00，水位推到 10:00:30
+     *  后到 10:00:40  → 还在 30 秒内，进入 [10:00, 10:01)
+     *  后到 10:00:20  → 水位已过，分钟指标不要它
+     *
+     *  某个分区 1 分钟没数据就标成空闲。
+     *  否则这个空分区会把别的分区的分钟窗口一直卡住。
+     * </pre>
+     */
+    private static SingleOutputStreamOperator<TrackingEvent> assignEventTime(DataStream<TrackingEvent> events) {
+        return events.assignTimestampsAndWatermarks(
+                WatermarkStrategy.<TrackingEvent>forBoundedOutOfOrderness(OUT_OF_ORDERNESS)
+                        .withTimestampAssigner((event, previous) -> event.getEventTimestamp())
+                        .withIdleness(SOURCE_IDLE_TIMEOUT));
+    }
+
+    /**
+     * 同一个 {@code event_id} 在 24 小时内只放行第一条。
+     *
+     * <pre>
+     *  #1 e1  exposure  → 留下
+     *  #2 e1  exposure  → 丢掉，后面的归因和分钟指标都看不到它
+     * </pre>
+     */
+    private static SingleOutputStreamOperator<TrackingEvent> deduplicate(DataStream<TrackingEvent> events) {
+        return events.keyBy(TrackingEvent::getEventId)
+                .process(new DeduplicateFunction());
+    }
+
+    /**
+     * 按 {@code user_id|experiment_id} 记住最近一次曝光，再给每条事件打 {@code attributed}。
+     * {@code u1} 在另一个实验上的曝光不会混进来。
+     *
+     * <pre>
+     *  #1 exposure A   7 天内第一次曝光     attributed = 1，记住「10:00:00 的版本 A」
+     *  #4 click    A   曝光后 40 秒         attributed = 1
+     *  #5 click    B   版本对不上           attributed = 0
+     *  #6 purchase A   19.9，仍在 7 天内    attributed = 1
+     *
+     *  若 10:05 又来一次版本 A 的曝光：attributed = 0，
+     *  但「最近曝光」改成 10:05。这之后的点击改和 10:05 比。
+     * </pre>
+     */
+    private static SingleOutputStreamOperator<TrackingEvent> attribute(DataStream<TrackingEvent> events) {
+        return events.keyBy(event -> event.getUserId() + "|" + event.getExperimentId())
+                .process(new AttributionFunction(ATTRIBUTION_WINDOW.toMillis()));
+    }
+
+    /**
+     * 去重、归因之后的事件全部写入 {@code ab.events.valid}，包含没归因上的。
+     *
+     * <pre>
+     *  写入 #1 #4 #5 #6
+     *  #5 的 attributed = 0 也在里面，方便核对「为什么没进分钟指标」
+     * </pre>
+     */
+    private static void writeValidEvents(DataStream<TrackingEvent> events, Properties properties) {
+        write(events, properties, "AB_EVENTS_VALID_TOPIC", "ab-valid-",
+                new TrackingEventSerializer(), "Valid Events");
+    }
+
+    /**
+     * 解析失败的原文写入 {@code ab.events.dlq}，不参与去重、归因和分钟指标。
+     *
+     * <pre>
+     *  #3 → {"raw":"...","error":"event_id is required","failed_at":"..."}
+     * </pre>
+     */
+    private static void writeInvalidEvents(
+            SingleOutputStreamOperator<TrackingEvent> parsed, Properties properties) {
+        write(parsed.getSideOutput(ParseEventFunction.DLQ), properties, "AB_EVENTS_DLQ_TOPIC", "ab-dlq-",
+                new SimpleStringSchema(), "Invalid Events");
+    }
+
+    /**
+     * 只统计 {@code attributed = 1} 的事件。同一个实验版本、同一分钟收成一行。
+     * 计数是事件条数，不是去重后的人数。
+     *
+     * <pre>
+     *  #5 attributed = 0，被滤掉
+     *
+     *  [10:00, 10:01)  exp|A   #1 曝光 + #4 点击
+     *  [10:01, 10:02)  exp|A   #6 购买，revenue = 19.9
+     * </pre>
+     */
+    private static void writeMinuteMetrics(DataStream<TrackingEvent> attributed, Properties properties) {
+        DataStream<MetricResult> metrics = attributed
+                .filter(EventAnalyticsJob::isAttributed)
+                .keyBy(event -> event.getExperimentId() + "|" + event.getVariantId())
+                .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+                .process(new MetricWindowFunction());
+        write(metrics, properties, "AB_METRICS_TOPIC", "ab-metrics-",
+                new MetricResultSerializer(), "Minute Metrics");
+    }
+
+    private static boolean isAttributed(TrackingEvent event) {
+        return event.getAttributed() == 1;
+    }
+
+    private static <T> void write(
+            DataStream<T> stream,
             Properties properties,
-            String topic,
+            String topicProperty,
             String transactionPrefix,
-            SerializationSchema<T> serializer) {
-        return KafkaSink.<T>builder()
-                .setBootstrapServers(properties.getProperty("BOOTSTRAP_SERVERS"))
-                .setRecordSerializer(KafkaRecordSerializationSchema.<T>builder()
-                        .setTopic(topic)
-                        .setValueSerializationSchema(serializer)
-                        .build())
-                .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
-                .setTransactionalIdPrefix(transactionPrefix)
-                .build();
-    }
-
-    static class ParseEventFunction extends ProcessFunction<String, TrackingEvent> {
-        private transient ObjectMapper mapper;
-
-        @Override
-        public void open(Configuration parameters) {
-            mapper = new ObjectMapper();
-        }
-
-        @Override
-        public void processElement(String raw, Context context, Collector<TrackingEvent> out) {
-            try {
-                JsonNode node = mapper.readTree(raw);
-                String eventId = required(node, "event_id");
-                String eventName = required(node, "event_name");
-                String eventTime = required(node, "event_time");
-                String receivedAt = required(node, "received_at");
-                String userId = required(node, "user_id");
-                String experimentId = required(node, "experiment_id");
-                String variantId = required(node, "variant_id");
-                if (!EVENT_NAMES.contains(eventName)) {
-                    throw new IllegalArgumentException("unsupported event_name");
-                }
-                UUID.fromString(eventId);
-                UUID.fromString(experimentId);
-                UUID.fromString(variantId);
-                Instant eventInstant = Instant.parse(eventTime);
-                Instant receivedInstant = Instant.parse(receivedAt);
-
-                TrackingEvent event = new TrackingEvent();
-                event.setEventId(eventId);
-                event.setEventName(eventName);
-                event.setEventTimestamp(eventInstant.toEpochMilli());
-                event.setEventTime(CLICKHOUSE_TIME.format(eventInstant));
-                event.setReceivedAt(CLICKHOUSE_TIME.format(receivedInstant));
-                event.setUserId(userId);
-                event.setSessionId(node.path("session_id").asText(""));
-                event.setExperimentId(experimentId);
-                event.setVariantId(variantId);
-                event.setProperties(node.path("properties").toString());
-                event.setVersion(receivedInstant.toEpochMilli());
-                JsonNode amount = node.path("properties").path("amount");
-                if (amount.isNumber() || amount.isTextual()) {
-                    event.setRevenue(new BigDecimal(amount.asText()));
-                }
-                out.collect(event);
-            } catch (Exception ex) {
-                ObjectNode invalid = mapper.createObjectNode();
-                invalid.put("raw", raw);
-                invalid.put("error", ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage());
-                invalid.put("failed_at", Instant.now().toString());
-                context.output(DLQ, invalid.toString());
-            }
-        }
-
-        private static String required(JsonNode node, String field) {
-            String value = node.path(field).asText("");
-            if (value.isBlank()) {
-                throw new IllegalArgumentException(field + " is required");
-            }
-            return value;
-        }
-    }
-
-    static class DeduplicateFunction extends KeyedProcessFunction<String, TrackingEvent, TrackingEvent> {
-        private transient ValueState<Boolean> seen;
-
-        @Override
-        public void open(Configuration parameters) {
-            ValueStateDescriptor<Boolean> descriptor =
-                    new ValueStateDescriptor<>("seen-event-id", Boolean.class);
-            descriptor.enableTimeToLive(StateTtlConfig.newBuilder(Time.hours(24)).build());
-            seen = getRuntimeContext().getState(descriptor);
-        }
-
-        @Override
-        public void processElement(TrackingEvent event, Context context, Collector<TrackingEvent> out)
-                throws Exception {
-            if (!Boolean.TRUE.equals(seen.value())) {
-                seen.update(Boolean.TRUE);
-                out.collect(event);
-            }
-        }
-    }
-
-    static class AttributionFunction
-            extends KeyedProcessFunction<String, TrackingEvent, TrackingEvent> {
-        private final long attributionWindowMillis;
-        private transient ValueState<ExposureState> exposure;
-
-        AttributionFunction(long attributionWindowMillis) {
-            this.attributionWindowMillis = attributionWindowMillis;
-        }
-
-        @Override
-        public void open(Configuration parameters) {
-            ValueStateDescriptor<ExposureState> descriptor =
-                    new ValueStateDescriptor<>("latest-exposure", ExposureState.class);
-            descriptor.enableTimeToLive(StateTtlConfig.newBuilder(Time.days(8)).build());
-            exposure = getRuntimeContext().getState(descriptor);
-        }
-
-        @Override
-        public void processElement(TrackingEvent event, Context context, Collector<TrackingEvent> out)
-                throws Exception {
-            ExposureState current = exposure.value();
-            if ("exposure".equals(event.getEventName())) {
-                boolean firstInWindow = isFirstExposure(
-                        current, event.getEventTimestamp(), attributionWindowMillis);
-                event.setAttributed(firstInWindow ? 1 : 0);
-                exposure.update(new ExposureState(event.getEventTimestamp(), event.getVariantId()));
-            } else {
-                boolean inWindow = isWithinAttribution(
-                        current,
-                        event.getVariantId(),
-                        event.getEventTimestamp(),
-                        attributionWindowMillis
-                );
-                event.setAttributed(inWindow ? 1 : 0);
-            }
-            out.collect(event);
-        }
-    }
-
-    static boolean isFirstExposure(ExposureState current, long eventTimestamp, long windowMillis) {
-        return current == null || eventTimestamp - current.timestamp > windowMillis;
-    }
-
-    static boolean isWithinAttribution(
-            ExposureState current,
-            String variantId,
-            long eventTimestamp,
-            long windowMillis) {
-        return current != null
-                && current.variantId.equals(variantId)
-                && eventTimestamp >= current.timestamp
-                && eventTimestamp - current.timestamp <= windowMillis;
-    }
-
-    public static class ExposureState implements Serializable {
-        public long timestamp;
-        public String variantId;
-
-        public ExposureState() {
-        }
-
-        ExposureState(long timestamp, String variantId) {
-            this.timestamp = timestamp;
-            this.variantId = variantId;
-        }
-    }
-
-    static class MetricWindowFunction
-            extends ProcessWindowFunction<TrackingEvent, MetricResult, String, TimeWindow> {
-        @Override
-        public void process(
-                String key,
-                Context context,
-                Iterable<TrackingEvent> events,
-                Collector<MetricResult> out) {
-            MetricResult result = new MetricResult();
-            result.setWindowStart(CLICKHOUSE_TIME.format(Instant.ofEpochMilli(context.window().getStart())));
-            result.setWindowEnd(CLICKHOUSE_TIME.format(Instant.ofEpochMilli(context.window().getEnd())));
-            result.setVersion(context.window().getEnd());
-            BigDecimal revenue = BigDecimal.ZERO;
-            for (TrackingEvent event : events) {
-                result.setExperimentId(event.getExperimentId());
-                result.setVariantId(event.getVariantId());
-                if ("exposure".equals(event.getEventName())) {
-                    result.setExposures(result.getExposures() + 1);
-                } else if ("click".equals(event.getEventName())) {
-                    result.setClicks(result.getClicks() + 1);
-                } else if ("purchase".equals(event.getEventName())) {
-                    result.setPurchases(result.getPurchases() + 1);
-                    revenue = revenue.add(event.getRevenue());
-                }
-            }
-            result.setRevenue(revenue);
-            out.collect(result);
-        }
-    }
-
-    static class TrackingEventSerializationSchema implements SerializationSchema<TrackingEvent> {
-        private transient ObjectMapper mapper;
-
-        @Override
-        public byte[] serialize(TrackingEvent event) {
-            if (mapper == null) {
-                mapper = new ObjectMapper();
-            }
-            ObjectNode node = mapper.createObjectNode();
-            node.put("event_id", event.getEventId());
-            node.put("event_name", event.getEventName());
-            node.put("event_time", event.getEventTime());
-            node.put("received_at", event.getReceivedAt());
-            node.put("user_id", event.getUserId());
-            node.put("session_id", event.getSessionId());
-            node.put("experiment_id", event.getExperimentId());
-            node.put("variant_id", event.getVariantId());
-            node.put("properties", event.getProperties());
-            node.put("attributed", event.getAttributed());
-            node.put("version", event.getVersion());
-            return node.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        }
-    }
-
-    static class MetricSerializationSchema implements SerializationSchema<MetricResult> {
-        private transient ObjectMapper mapper;
-
-        @Override
-        public byte[] serialize(MetricResult metric) {
-            if (mapper == null) {
-                mapper = new ObjectMapper();
-            }
-            ObjectNode node = mapper.createObjectNode();
-            node.put("window_start", metric.getWindowStart());
-            node.put("window_end", metric.getWindowEnd());
-            node.put("experiment_id", metric.getExperimentId());
-            node.put("variant_id", metric.getVariantId());
-            node.put("exposures", metric.getExposures());
-            node.put("clicks", metric.getClicks());
-            node.put("purchases", metric.getPurchases());
-            node.put("revenue", metric.getRevenue());
-            node.put("version", metric.getVersion());
-            return node.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        }
+            SerializationSchema<T> serializer,
+            String name) {
+        stream.sinkTo(KafkaIO.sink(
+                properties,
+                properties.getProperty(topicProperty),
+                transactionPrefix,
+                serializer
+        )).name(name);
     }
 }

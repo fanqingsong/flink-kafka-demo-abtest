@@ -7,6 +7,7 @@
                            PostgreSQL 保存实验配置
 ```
 
+分流、曝光、归因和指标的业务含义见 [A/B 测试业务逻辑](ab-business-logic.md)。
 Kafka 和 Flink 在这条链路里各做什么、ClickHouse 如何自己消费 Kafka 落库、字段如何变化，可先看
 [数据模型与端到端数据流](data-model-and-flow.md)。
 

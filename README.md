@@ -9,7 +9,7 @@
 
 Kafka 是埋点消息总线，把接入、计算和存储拆开。Web 把原始事件写入 `ab.events.raw`，自己不保存事件。Flink 作业 `EventAnalyticsJob` 消费这条流，做校验、去重、归因和分钟聚合，再写回 `ab.events.valid`、`ab.events.dlq` 和 `ab.metrics.1m`。ClickHouse 自己拉取这两个结果 topic：Kafka 表引擎负责消费，物化视图写入 `ReplacingMergeTree`，供 Dashboard 查询。
 
-各 topic 的分工、Flink 四步处理、ClickHouse 落库方式，以及字段变化和指标口径见 [数据模型与端到端数据流](docs/data-model-and-flow.md)。SDK、API 和排查步骤见 [埋点与 A/B 测试](docs/ab-testing-mvp.md)。
+业务上谁看哪个版本、曝光和点击怎么算到版本上，见 [A/B 测试业务逻辑](docs/ab-business-logic.md)。各 topic 的分工、Flink 四步处理、ClickHouse 落库方式，以及字段变化和指标口径见 [数据模型与端到端数据流](docs/data-model-and-flow.md)。SDK、API 和排查步骤见 [埋点与 A/B 测试](docs/ab-testing-mvp.md)。
 
 ## 架构
 

@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>分钟指标</title>
+  <style>
+    body { margin: 0; background: #f3efe6; color: #1d1a16; font-family: "Segoe UI", "PingFang SC", sans-serif; }
+    main { width: min(1180px, calc(100% - 32px)); margin: 30px auto; }
+    section { background: #fffdf9; border: 1px solid #e2d9cc; border-radius: 14px; padding: 18px; margin: 14px 0; overflow-x: auto; }
+    h1, h2 { margin-top: 0; }
+    nav { display: flex; gap: 14px; }
+    a { color: #0d6b58; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; border-bottom: 1px solid #e2d9cc; padding: 9px 7px; white-space: nowrap; }
+    th { color: #6d655c; }
+    label { color: #6d655c; }
+    select { margin-left: 8px; padding: 6px 8px; border: 1px solid #e2d9cc; border-radius: 7px; background: white; font: inherit; }
+    .muted { color: #6d655c; }
+  </style>
+</head>
+<body>
+<main>
+  <nav><a href="/ab-demo.html">A/B 演示</a><a href="/ab-dashboard.html">实验 Dashboard</a></nav>
+  <h1>分钟指标</h1>
+  <p class="muted">已归因事件在每一分钟里的条数和购买金额。同一分钟内同一用户的多次点击会分别计数。窗口按事件时间关闭，当前这一分钟通常要等水位线越过窗口结束才会出现。</p>
+  <p>
+    <label>实验
+      <select id="experiment"></select>
+    </label>
+    <label>范围
+      <select id="range">
+        <option value="60">最近 60 分钟</option>
+        <option value="1440">最近 24 小时</option>
+        <option value="10080" selected>最近 7 天</option>
+      </select>
+    </label>
+  </p>
+  <p class="muted" id="status">正在加载……</p>
+
+  <section>
+    <h2>按实验版本</h2>
+    <table>
+      <thead><tr><th>窗口开始</th><th>窗口结束</th><th>版本</th><th>曝光次数</th><th>点击次数</th><th>购买次数</th><th>金额</th></tr></thead>
+      <tbody id="minutes"></tbody>
+    </table>
+  </section>
+</main>
+<script>
+  const status = document.querySelector("#status");
+  const experimentSelect = document.querySelector("#experiment");
+  let experiments = [];
+
+  function td(text) {
+    const cell = document.createElement("td");
+    cell.textContent = text == null ? "" : text;
+    return cell;
+  }
+
+  function selectedExperiment() {
+    return experiments.find(item => item.id === experimentSelect.value) || null;
+  }
+
+  async function loadExperiments() {
+    const response = await fetch("/api/experiments");
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || "实验加载失败");
+    const previous = experimentSelect.value;
+    experiments = body;
+    experimentSelect.replaceChildren();
+    for (const experiment of experiments) {
+      const option = document.createElement("option");
+      option.value = experiment.id;
+      option.textContent = `${experiment.name}（${experiment.status}）`;
+      experimentSelect.append(option);
+    }
+    const stillThere = experiments.some(item => item.id === previous);
+    const running = experiments.find(item => item.status === "RUNNING");
+    experimentSelect.value = stillThere ? previous : (running || experiments[0] || {}).id || "";
+  }
+
+  async function loadMinutes() {
+    const tbody = document.querySelector("#minutes");
+    tbody.replaceChildren();
+    const experiment = selectedExperiment();
+    if (!experiment) return;
+    const to = new Date();
+    const from = new Date(to.getTime() - Number(document.querySelector("#range").value) * 60 * 1000);
+    const params = new URLSearchParams({ from: from.toISOString(), to: to.toISOString() });
+    const response = await fetch(`/api/experiments/${experiment.id}/metrics/1m?${params}`);
+    const rows = await response.json();
+    if (!response.ok) throw new Error(rows.detail || "分钟指标加载失败");
+    const variants = new Map(experiment.variants.map(item => [item.id, item.key]));
+    if (rows.length === 0) {
+      const row = document.createElement("tr");
+      const cell = td("这个时间范围内还没有已关闭的分钟窗口");
+      cell.colSpan = 7;
+      row.append(cell);
+      tbody.append(row);
+      return;
+    }
+    for (const metric of rows) {
+      const row = document.createElement("tr");
+      row.append(
+        td(metric.window_start),
+        td(metric.window_end),
+        td(variants.get(metric.variant_id) || metric.variant_id),
+        td(metric.exposures),
+        td(metric.clicks),
+        td(metric.purchases),
+        td(metric.revenue)
+      );
+      tbody.append(row);
+    }
+  }
+
+  async function refresh() {
+    try {
+      await loadExperiments();
+      await loadMinutes();
+      status.textContent = `最后刷新：${new Date().toLocaleTimeString()}`;
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  }
+
+  document.querySelector("#range").addEventListener("change", () => {
+    loadMinutes().then(() => {
+      status.textContent = `最后刷新：${new Date().toLocaleTimeString()}`;
+    }).catch(error => {
+      status.textContent = error.message;
+    });
+  });
+
+  experimentSelect.addEventListener("change", () => {
+    loadMinutes().then(() => {
+      status.textContent = `最后刷新：${new Date().toLocaleTimeString()}`;
+    }).catch(error => {
+      status.textContent = error.message;
+    });
+  });
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</body>
+</html>

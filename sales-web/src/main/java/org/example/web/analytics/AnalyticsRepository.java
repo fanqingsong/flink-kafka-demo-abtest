@@ -57,6 +57,35 @@ public class AnalyticsRepository {
         }, experimentId.toString(), from.toString(), to.toString());
     }
 
+    public List<Map<String, Object>> minuteMetrics(UUID experimentId, Instant from, Instant to, int limit) {
+        return clickHouse.query("""
+                SELECT
+                    window_start,
+                    window_end,
+                    toString(variant_id) AS variant_id,
+                    exposures,
+                    clicks,
+                    purchases,
+                    revenue
+                FROM analytics.ab_metrics_1m FINAL
+                WHERE experiment_id = toUUID(?)
+                  AND window_start >= parseDateTime64BestEffort(?)
+                  AND window_start < parseDateTime64BestEffort(?)
+                ORDER BY window_start DESC, variant_id
+                LIMIT ?
+                """, (rs, rowNum) -> {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("window_start", rs.getString("window_start"));
+            row.put("window_end", rs.getString("window_end"));
+            row.put("variant_id", rs.getString("variant_id"));
+            row.put("exposures", rs.getLong("exposures"));
+            row.put("clicks", rs.getLong("clicks"));
+            row.put("purchases", rs.getLong("purchases"));
+            row.put("revenue", rs.getBigDecimal("revenue"));
+            return row;
+        }, experimentId.toString(), from.toString(), to.toString(), limit);
+    }
+
     public List<Map<String, Object>> recentEvents(int limit) {
         return clickHouse.query("""
                 SELECT

@@ -1,138 +1,89 @@
 # 数据模型与端到端数据流
 
-本文是项目的数据架构总览，帮助新读者快速回答三个问题：
+本文说明 A/B 测试演示里有哪些数据、经过哪些组件，以及最终查询用什么口径。
 
-1. 系统里有哪些数据；
-2. 数据经过哪些组件、发生了什么变化；
-3. 最终查询采用什么口径。
+## 先看懂这条数据流
 
-项目包含两条彼此独立、但共用 Kafka、Flink 和 Web 应用的链路：
+Kafka 是埋点的消息总线，Flink 是常驻的实时计算作业。浏览器上报的曝光、点击、购买不会直接写入分析库：Spring Boot 只做接入校验，把事件放进 Kafka；Flink 消费后再清洗、去重、归因并按分钟聚合，结果写回 Kafka，由 ClickHouse 消费后供 Dashboard 查询。
 
-- **销售分析 Demo**：演示按商品累计销售额，以及购买记录与商品目录的流式 Join；
-- **A/B 测试 MVP**：演示实验分流、埋点接入、事件校验、去重、归因、分钟聚合和分析查询。
+```text
+浏览器 SDK → Spring Boot → Kafka raw → Flink → Kafka valid / metrics → ClickHouse
+                                      ↘ Kafka dlq
+```
+
+Web 本身不保存事件。PostgreSQL 只保存实验、版本、权重和流量配置，不保存埋点事件。
+
+### Kafka：把接入、计算和存储拆开
+
+Web 启动时创建下面四个 topic，每个 4 个分区。生产者和消费者互不直连，所以接入可以先把事件放下，计算和落库各自按自己的速度消费。
+
+| Topic | 谁写入 | 谁消费 | 里面是什么 |
+| --- | --- | --- | --- |
+| `ab.events.raw` | Web 埋点 API | `EventAnalyticsJob` | 原始埋点。message key 是 `user_id`。 |
+| `ab.events.valid` | Flink | ClickHouse | 校验、去重、归因之后的有效事件。 |
+| `ab.events.dlq` | Flink | 人工排查 | 解析失败的坏数据，结构为 `raw`、`error`、`failed_at`。 |
+| `ab.metrics.1m` | Flink | ClickHouse | 按实验版本聚合的 1 分钟指标。 |
+
+### Flink：`EventAnalyticsJob` 做的四件事
+
+作业消费 `ab.events.raw`，在 TaskManager 上常驻，按顺序做：
+
+1. **校验**。只接受 `exposure`、`click`、`purchase`，并检查必填字段、UUID 和 ISO 时间。解析失败的记录进入 `ab.events.dlq`，不进入后续统计。
+2. **去重**。按 `event_id` 去掉重复上报，状态保留 24 小时。
+3. **归因**。按 `user_id + experiment_id` 关联曝光和后续行为，归因窗口 7 天。同一用户在窗口内的首次曝光，以及落在该曝光之后、同一版本上的 click / purchase，标记为 `attributed = 1`。
+4. **分钟聚合**。只把 `attributed = 1` 的事件按 `(experiment_id, variant_id)` 放进 1 分钟滚动窗口，统计曝光、点击、购买条数和购买金额，写入 `ab.metrics.1m`。
+
+去重和归因之后的每条事件都会写入 `ab.events.valid`，包括 `attributed = 0` 的记录。分钟指标只统计已归因事件。
+
+作业每 30 秒做一次 exactly-once checkpoint，Kafka sink 也使用 exactly-once。字段怎么变、归因判定和查询口径见下文第 2 节到第 5 节。
+
+### ClickHouse：自己拉取 Kafka 并落库
+
+`ab.events.valid` 和 `ab.metrics.1m` 由 `clickhouse-server` 自己消费。服务进程里的后台线程按块拉取消息，物化视图再把这些行插入 `ReplacingMergeTree`。Flink 写到 Kafka 即结束，没有向 ClickHouse 执行 `INSERT`。表之间如何衔接、offset 何时提交，见第 4 节。
 
 ## 1. 全局架构
 
 ```mermaid
 flowchart TB
-  browser["浏览器<br/>销售页面 · JS SDK · A/B Dashboard"]
-  web["Spring Boot Web<br/>HTTP API · Kafka producer/consumer · 查询服务"]
+  browser["浏览器<br/>JS SDK · 实验页 · Dashboard"]
+  web["Spring Boot Web<br/>HTTP API · Kafka producer · 查询服务"]
   pg[("PostgreSQL<br/>实验与版本配置")]
-  ch[("ClickHouse<br/>A/B 事件明细与分钟指标")]
+  ch[("ClickHouse<br/>事件明细与分钟指标")]
 
   browser <--> web
   web <--> pg
 
-  subgraph pipelines["Kafka + Flink 流处理"]
-    direction TB
-
-    subgraph sales["销售分析链路"]
-      direction LR
-      salesIn["Kafka 输入<br/>demo.products<br/>demo.purchases"]
-      salesJobs["Flink<br/>RunningTotals<br/>JoinStreams"]
-      salesOut["Kafka 输出<br/>demo.running.totals<br/>demo.purchases.enriched"]
-      salesIn --> salesJobs --> salesOut
-    end
-
-    subgraph ab["A/B 测试链路"]
-      direction LR
-      raw["Kafka 输入<br/>ab.events.raw"]
-      analytics["Flink<br/>EventAnalyticsJob"]
-      valid["Kafka 输出<br/>ab.events.valid"]
-      metrics["Kafka 输出<br/>ab.metrics.1m"]
-      dlq["Kafka 异常<br/>ab.events.dlq"]
-      raw --> analytics
-      analytics --> valid
-      analytics --> metrics
-      analytics --> dlq
-    end
+  subgraph pipeline["Kafka + Flink"]
+    direction LR
+    raw["Kafka 输入<br/>ab.events.raw"]
+    analytics["Flink<br/>EventAnalyticsJob"]
+    valid["Kafka 输出<br/>ab.events.valid"]
+    metrics["Kafka 输出<br/>ab.metrics.1m"]
+    dlq["Kafka 异常<br/>ab.events.dlq"]
+    raw --> analytics
+    analytics --> valid
+    analytics --> metrics
+    analytics --> dlq
   end
 
-  web -->|"商品目录、购买"| salesIn
-  salesOut -->|"页面状态"| web
   web -->|"埋点事件"| raw
   valid --> ch
   metrics --> ch
   ch -->|"指标、最近事件"| web
 ```
 
-图按“接入层 → 两条流处理链路 → 查询存储”阅读。销售结果回到 Web
-内存供页面展示；A/B 结果进入 ClickHouse 后由 Web 查询，DLQ 仅用于人工排查。
-
-组件分工：
-
 | 组件 | 职责 | 是否保存业务数据 |
 | --- | --- | --- |
 | 浏览器 / JS SDK | 请求实验版本、渲染版本、上报曝光/点击/购买 | `localStorage` 保存匿名用户 ID，`sessionStorage` 保存会话和曝光标记 |
-| Spring Boot Web | 创建 topic、校验请求、生产/消费 Kafka 消息、提供查询 API | 销售页面状态只保存在内存 |
+| Spring Boot Web | 创建 topic、校验请求、写入 Kafka、提供查询 API | 不保存事件 |
 | PostgreSQL | 保存实验、版本、权重、流量和版本 payload | 是，实验配置的事实来源 |
-| Kafka | 解耦生产、计算和存储节点，保存原始事件及计算结果 | 是，按 topic 保留消息 |
-| Flink | 累计、Join、事件校验、去重、归因和窗口聚合 | 是，算子状态通过 checkpoint 持久化 |
-| ClickHouse | 保存 A/B 有效事件和分钟指标，支持分析查询 | 是，A/B 分析数据的查询存储 |
+| Kafka | 解耦接入、计算和存储 | 是，按 topic 保留消息 |
+| Flink | 校验、去重、归因和窗口聚合 | 是，算子状态通过 checkpoint 持久化 |
+| ClickHouse | 保存有效事件和分钟指标 | 是，分析查询的存储 |
 
-Compose 默认以单机演示方式运行：Kafka 单 Broker，Flink 单 JobManager、单 TaskManager（4 slots），默认并行度为 1。三个提交容器把作业提交给 JobManager 后退出，作业继续在 Flink 集群中运行。
+Compose 以单机方式运行：Kafka 单 Broker，Flink 单 JobManager、单 TaskManager（2 slots），默认并行度为 1。`event-analytics` 提交作业后退出，作业继续在集群中运行。
 
-## 2. 数据模型分层
-
-### 2.1 销售链路模型
-
-```mermaid
-flowchart LR
-  product["Product<br/>商品目录"]
-  purchase["Purchase<br/>购买事实"]
-  total["RunningTotal<br/>按商品累计快照"]
-  enriched["PurchaseEnriched<br/>购买 + 商品宽表"]
-
-  purchase -->|"按 product_id 累计"| total
-  product -->|"按 product_id Join"| enriched
-  purchase -->|"按 product_id Join"| enriched
-```
-
-#### Product：商品维度
-
-来源为 `catalog.json`，Web 应用仅在 `demo.products` 为空时写入一次。
-
-| 字段组 | 主要字段 | 含义 |
-| --- | --- | --- |
-| 标识 | `product_id` | 商品业务键，也是 Join 键 |
-| 描述 | `category`、`item`、`size` | 商品分类、名称和规格 |
-| 金额 | `cogs`、`price` | 成本和目录售价 |
-| 库存/标签 | `inventory_level`、`contains_*`、`propensity_to_buy` | 演示用商品属性 |
-
-#### Purchase：购买事实
-
-由 `POST /api/purchases` 生成并写入 `demo.purchases`。
-
-| 字段组 | 主要字段 | 含义 |
-| --- | --- | --- |
-| 标识和时间 | `transaction_id`、`transaction_time` | 交易 ID 和发生时间 |
-| 商品和数量 | `product_id`、`price`、`quantity` | 商品键、成交单价和件数 |
-| 优惠 | `is_member`、`member_discount` | 会员标记和折扣 |
-| 金额 | `supplement_price`、`total_purchase` | 加料金额和该笔实付金额 |
-
-`product_name` 只用于 Web 响应，写 Kafka 前会移除；下游名称来自商品目录 Join。
-
-#### RunningTotal：累计快照
-
-`RunningTotals` 按 `product_id` 保存状态。每收到一笔购买，就输出该商品截至当前的最新累计快照：
-
-| 字段 | 计算 |
-| --- | --- |
-| `event_time` | 当前到达的购买时间 |
-| `product_id` | 聚合键 |
-| `transactions` | 购买记录数累计 |
-| `quantities` | 购买件数累计 |
-| `sales` | `total_purchase` 累计 |
-
-它不是单笔增量，也不是数据库中唯一的一行；`demo.running.totals` 会保留连续产生的多个快照。
-
-#### PurchaseEnriched：购买宽表
-
-`JoinStreams` 按 `product_id` 对 `Product` 与 `Purchase` 做内连接，输出购买字段及商品名称、分类、规格、成本和标签。商品目录缺少对应键时，该购买不会产生 enriched 结果。
-
-### 2.2 A/B 链路模型
-
-A/B 数据分为三层：
+## 2. 数据模型
 
 ```mermaid
 flowchart LR
@@ -146,7 +97,7 @@ flowchart LR
   processed -->|"1 分钟事件时间窗口"| aggregate
 ```
 
-#### 实验配置：PostgreSQL
+### 实验配置：PostgreSQL
 
 `experiments` 保存实验级配置：
 
@@ -167,7 +118,7 @@ flowchart LR
 
 分流使用 `SHA-256(experimentKey:userId:salt)`。配置不变时，同一用户会稳定进入同一版本。PostgreSQL 只负责配置和分流，不存埋点事件。
 
-#### 原始事件：API 与 `ab.events.raw`
+### 原始事件：API 与 `ab.events.raw`
 
 标准事件只允许 `exposure`、`click`、`purchase`：
 
@@ -184,11 +135,9 @@ flowchart LR
 | `sdk_version`、`page_url` | 否 | SDK 和页面上下文 |
 | `received_at` | 服务端生成 | Web 服务接收时间 |
 
-Web 服务在写入 Kafka 前检查：事件类型受支持、实验正在运行、版本属于该实验。单次 API 请求最多接收 100 条事件。
+Web 在写入 Kafka 前检查：事件类型受支持、实验正在运行、版本属于该实验。单次请求最多 100 条事件。
 
-#### 处理后事件：`ab.events.valid` 与 `analytics.ab_events`
-
-Flink 输出字段：
+### 处理后事件：`ab.events.valid` 与 `analytics.ab_events`
 
 | 字段 | 变化或用途 |
 | --- | --- |
@@ -198,17 +147,11 @@ Flink 输出字段：
 | `attributed` | Flink 归因结果，`0` 或 `1` |
 | `version` | `received_at` 的 epoch 毫秒，用于 ClickHouse 替换版本 |
 
-`sdk_version`、`page_url` 不会进入 valid topic，因此 ClickHouse 中也没有这两个字段。解析失败的数据写入 `ab.events.dlq`，结构为 `raw`、`error`、`failed_at`。
+`sdk_version`、`page_url` 不会进入 valid topic。解析失败的数据写入 `ab.events.dlq`，结构为 `raw`、`error`、`failed_at`。
 
-ClickHouse 目标表 `analytics.ab_events` 使用：
+`analytics.ab_events` 使用 `ReplacingMergeTree(version)`，按 `toYYYYMM(event_time)` 分区，按 `(experiment_id, variant_id, event_time, event_id)` 排序。查询使用 `FINAL`。当前未配置 TTL。
 
-- `ReplacingMergeTree(version)`；
-- 按 `toYYYYMM(event_time)` 分区；
-- 按 `(experiment_id, variant_id, event_time, event_id)` 排序；
-- 查询侧使用 `FINAL` 合并同排序键的版本；
-- 当前未配置 TTL。
-
-#### 分钟指标：`ab.metrics.1m` 与 `analytics.ab_metrics_1m`
+### 分钟指标：`ab.metrics.1m` 与 `analytics.ab_metrics_1m`
 
 只对 `attributed = 1` 的事件，按 `(experiment_id, variant_id)` 进入 1 分钟滚动事件时间窗口：
 
@@ -220,39 +163,9 @@ ClickHouse 目标表 `analytics.ab_events` 使用：
 | `revenue` | purchase 的 `properties.amount` 之和 |
 | `version` | 窗口结束时间的 epoch 毫秒 |
 
-表 `analytics.ab_metrics_1m` 同样使用 `ReplacingMergeTree(version)`，按月分区，并以 `(experiment_id, variant_id, window_start)` 排序。
+`analytics.ab_metrics_1m` 同样使用 `ReplacingMergeTree(version)`，按月分区，并以 `(experiment_id, variant_id, window_start)` 排序。
 
-## 3. 数据如何流转和处理
-
-### 3.1 销售链路
-
-```mermaid
-sequenceDiagram
-  participant UI as 销售页面
-  participant Web as Spring Boot
-  participant K as Kafka
-  participant RT as RunningTotals
-  participant JS as JoinStreams
-
-  Web->>K: 启动时写入 demo.products（仅 topic 为空时）
-  UI->>Web: POST /api/purchases
-  Web->>K: demo.purchases
-  par 累计
-    K->>RT: Purchase
-    RT->>RT: keyBy(product_id) + reduce
-    RT->>K: demo.running.totals
-  and 补充商品信息
-    K->>JS: Product + Purchase
-    JS->>JS: SQL inner join(product_id)
-    JS->>K: demo.purchases.enriched
-  end
-  K-->>Web: tail purchases / totals / enriched
-  Web-->>UI: 内存状态快照
-```
-
-销售链路不使用事件时间窗口和 watermark。两个 sink 均为 `AT_LEAST_ONCE`，故障恢复边界可能出现重复结果；消费累计 topic 时应把消息理解为“快照流”，而不是可直接求和的增量流。
-
-### 3.2 A/B 链路
+## 3. 处理流程
 
 ```mermaid
 flowchart TD
@@ -268,32 +181,50 @@ flowchart TD
   metric["ab.metrics.1m"]
   eventsTable[("analytics.ab_events")]
   metricTable[("analytics.ab_metrics_1m")]
-  query["8. Dashboard API 查询"]
+  query["8a. Dashboard API<br/>用户数"]
+  minutePage["8b. 分钟指标页<br/>事件条数"]
 
   sdk --> api --> raw --> parse
   parse -->|"否"| dlq
   parse -->|"是；30 秒乱序 watermark"| dedup --> attr
   attr --> valid --> eventsTable --> query
-  attr --> window --> metric --> metricTable
+  attr --> window --> metric --> metricTable --> minutePage
 ```
 
-处理规则如下：
+1. **解析**：检查必填字段、三个 UUID、事件名和 ISO 时间；错误进入 DLQ。
+2. **事件时间**：采用 `event_time`，允许 30 秒乱序；输入空闲 1 分钟后标记 idle。
+3. **去重**：按 `event_id` 保存 24 小时状态。TTL 到期后同一 ID 再次出现，仍可能被重新处理。
+4. **归因**：同一用户和实验的首个曝光标记为 `attributed = 1`；7 天内后续曝光标记为 `0`，并更新最近曝光。click/purchase 必须不早于最近曝光、间隔不超过 7 天，且 `variant_id` 相同，才标记为 `1`。
+5. **输出**：去重后的事件进入 valid；只有 `attributed = 1` 的事件进入分钟聚合。
+6. **落库**：ClickHouse 用 Kafka 表引擎消费 valid 和 metrics，物化视图写入 MergeTree。见第 4 节。
 
-1. **解析和校验格式**：检查必填字段、三个 UUID、事件名和 ISO 时间；错误进入 DLQ。
-2. **事件时间**：采用 `event_time`，允许 30 秒乱序；输入空闲 1 分钟后标记 idle，避免阻塞全局 watermark。
-3. **去重**：按 `event_id` 保存 24 小时 Flink 状态。同一 ID 在 TTL 到期后再次出现，仍可能被重新处理。
-4. **曝光归因**：
-   - 同一用户和实验的首个曝光标记为 `attributed = 1`；
-   - 7 天内后续曝光标记为 `0`，但会更新“最近曝光”状态；
-   - click/purchase 必须不早于最近曝光、间隔不超过 7 天，且 `variant_id` 相同，才标记为 `1`。
-5. **输出**：全部成功解析且去重后的事件进入 valid；只有 `attributed = 1` 的事件进入分钟聚合。
-6. **落库**：ClickHouse Kafka Engine 消费 valid/metrics topic，物化视图把消息写入 MergeTree 目标表。
+作业每 30 秒 checkpoint，Kafka sink 使用 `EXACTLY_ONCE`。ClickHouse 侧是至少一次，再用 `ReplacingMergeTree(version)` 和查询 `FINAL` 合并重复行。
 
-A/B 作业显式启用 30 秒 checkpoint，Kafka sink 使用 `EXACTLY_ONCE` 和事务 ID 前缀。Flink 到 Kafka 的输出具备 checkpoint 协调的精确一次语义；ClickHouse 侧再通过 `ReplacingMergeTree(version)` 和查询 `FINAL` 处理版本合并。
+## 4. ClickHouse 如何从 Kafka 落库
 
-## 4. 查询口径
+`ab.events.valid` 和 `ab.metrics.1m` 的落库发生在 `clickhouse-server` 内部。后台线程作为 Kafka 消费者按块拉取消息，解析后交给物化视图，由物化视图插入真正存数据的表。这是拉取，不是 Kafka 向 ClickHouse 推送。
 
-A/B Dashboard 的指标 API **不读取** `analytics.ab_metrics_1m`，而是从 `analytics.ab_events FINAL` 实时计算：
+数据目录为空时，ClickHouse 入口脚本会执行 `docker/clickhouse/init/001_ab_analytics.sql`。每个 topic 对应三张表：
+
+| Kafka topic | Kafka 引擎表 | 物化视图 | 落地表 |
+| --- | --- | --- | --- |
+| `ab.events.valid` | `analytics.ab_events_kafka` | `analytics.ab_events_mv` | `analytics.ab_events` |
+| `ab.metrics.1m` | `analytics.ab_metrics_1m_kafka` | `analytics.ab_metrics_1m_mv` | `analytics.ab_metrics_1m` |
+
+Kafka 引擎表使用 `ENGINE = Kafka`，只声明订阅，不保存行。两张表都连接 Compose 网络内的 `kafka:29092`，格式为 `JSONEachRow`，与 Flink 写出的一行一个 JSON 对应。消费组分别是 `clickhouse-ab-events` 和 `clickhouse-ab-metrics`，每张表 `kafka_num_consumers = 1`。
+
+物化视图定义为 `SELECT *`，列名与 Flink 序列化字段一致。一块消息成功插入落地表之后，ClickHouse 才提交这批 Kafka offset。
+
+offset 在写入之后提交，因此投递语义是至少一次。进程在提交前退出时，同一批消息会再次进入落地表。两张落地表都是 `ReplacingMergeTree(version)`，后台合并时对相同排序键保留 `version` 最大的一行。合并不会在插入当时完成，所以 Dashboard 查询 `analytics.ab_events` 时使用 `FINAL`。
+
+- `analytics.ab_events` 按 `toYYYYMM(event_time)` 分区，排序键是 `(experiment_id, variant_id, event_time, event_id)`。
+- `analytics.ab_metrics_1m` 按 `toYYYYMM(window_start)` 分区，排序键是 `(experiment_id, variant_id, window_start)`。
+
+停止消费时分离对应的物化视图；重新挂上后，从该消费组已提交的 offset 继续拉取。
+
+## 5. 查询口径
+
+实验 Dashboard 的 `/api/experiments/{id}/metrics` 不读取 `analytics.ab_metrics_1m`，而是从 `analytics.ab_events FINAL` 计算：
 
 | 指标 | 口径 |
 | --- | --- |
@@ -305,52 +236,35 @@ A/B Dashboard 的指标 API **不读取** `analytics.ab_metrics_1m`，而是从 
 | 订单数 | 已归因 purchase 事件条数 |
 | GMV | 已归因 purchase 的 `properties.amount` 之和 |
 
-因此存在两套有意不同的统计粒度：
+分钟指标页 `/ab-metrics-1m.html` 调用 `/api/experiments/{id}/metrics/1m`，读取 `analytics.ab_metrics_1m FINAL`。页面可选最近 60 分钟、24 小时或 7 天，默认是 7 天。表中的 `exposures`、`clicks`、`purchases` 是该分钟内的事件条数，`revenue` 是购买金额。这些计数不能和 Dashboard 的用户数直接比较。
 
-- `ab_metrics_1m` 是**事件数分钟聚合**，适合时序监控和快速汇总；
-- Dashboard 是从事件明细计算的**用户数指标**，用于实验效果分析。
+## 6. Topic
 
-二者不能直接逐项比较，尤其是 `clicks` 与“点击用户数”、`purchases` 与“购买用户数”。
-
-## 5. Topic 与生产消费关系
-
-| Topic | 分区 | 生产者 | 消费者 | 数据模型 |
+| Topic | 分区 | 生产者 | 消费者 | 数据 |
 | --- | ---: | --- | --- | --- |
-| `demo.products` | 1 | Web bootstrap | `JoinStreams` | Product |
-| `demo.purchases` | 1 | Web purchase API | `RunningTotals`、`JoinStreams`、Web listener | Purchase |
-| `demo.running.totals` | 1 | `RunningTotals` | Web listener | RunningTotal |
-| `demo.purchases.enriched` | 1 | `JoinStreams` | Web listener | PurchaseEnriched |
-| `ab.events.raw` | 4 | Tracking API | `EventAnalyticsJob` | RawTrackingEvent |
-| `ab.events.valid` | 4 | `EventAnalyticsJob` | ClickHouse Kafka Engine | TrackingEvent |
-| `ab.events.dlq` | 4 | `EventAnalyticsJob` | 人工排查 | Invalid event |
-| `ab.metrics.1m` | 4 | `EventAnalyticsJob` | ClickHouse Kafka Engine | MetricResult |
+| `ab.events.raw` | 4 | Tracking API | `EventAnalyticsJob` | 原始事件 |
+| `ab.events.valid` | 4 | `EventAnalyticsJob` | ClickHouse Kafka Engine | 有效事件 |
+| `ab.events.dlq` | 4 | `EventAnalyticsJob` | 人工排查 | 无效事件 |
+| `ab.metrics.1m` | 4 | `EventAnalyticsJob` | ClickHouse Kafka Engine | 分钟指标 |
 
-所有消息均为 JSON 文本；项目未使用 Schema Registry、Avro 或 Protobuf。
+消息均为 JSON 文本。
 
-## 6. 关键设计边界与注意事项
+## 7. 设计边界
 
-1. **两条链路互相独立**：销售数据不会进入 PostgreSQL 或 ClickHouse；A/B 数据不会参与销售累计和 Join。
-2. **Join 是普通流式内连接**：商品流并非显式 temporal table，目录更新和消息重放会影响 Join 状态及输出。
-3. **销售 sink 为至少一次**：下游应容忍重复；累计消息是连续快照。
-4. **A/B 字段会在阶段间变化**：时间格式被改写，`properties` 从对象变成字符串，`sdk_version` 和 `page_url` 被丢弃。
-5. **去重和归因时长不同**：去重状态 24 小时，归因窗口 7 天；24 小时后重放相同 `event_id` 可能再次参与归因和统计。
-6. **ClickHouse 没有 TTL**：数据会持续增长；生产化前应按保留策略补充 TTL 和容量规划。
-7. **必须明确指标粒度**：分钟表统计事件数，Dashboard 统计 UV；新增查询前应先选择权威口径。
-8. **演示环境不是高可用部署**：Kafka 和数据库均为单节点、topic 副本数为 1。
+1. 时间格式会被改写，`properties` 从对象变成字符串，`sdk_version` 和 `page_url` 被丢弃。
+2. 去重状态 24 小时，归因窗口 7 天。24 小时后重放相同 `event_id` 可能再次参与统计。
+3. ClickHouse 没有 TTL，演示数据会一直保留。
+4. Kafka 和数据库都是单节点，topic 副本数为 1。
+5. ClickHouse 消费 Kafka 是至少一次。offset 提交前进程退出时，同一批消息会再次插入；`ReplacingMergeTree(version)` 在合并后保留 `version` 较大的行。
 
-## 7. 代码导航
+## 8. 代码导航
 
 | 主题 | 关键文件 |
 | --- | --- |
 | 容器和运行拓扑 | `docker-compose.yml` |
 | Topic 配置和创建 | `sales-web/src/main/resources/application.yml`、`sales-web/src/main/java/org/example/web/KafkaSetup.java` |
-| 销售消息生成 | `sales-web/src/main/java/org/example/web/PurchaseMessages.java` |
-| 销售 Flink 作业 | `flink-jobs/src/main/java/org/example/RunningTotals.java`、`JoinStreams.java` |
-| 销售 Flink 模型 | `flink-jobs/src/main/java/org/example/model/` |
-| 实验配置模型 | `sales-web/src/main/resources/db/migration/V1__experiments.sql` |
-| 埋点 API 模型和接入 | `sales-web/src/main/java/org/example/web/tracking/` |
-| A/B Flink 作业 | `flink-jobs/src/main/java/org/example/ab/EventAnalyticsJob.java` |
+| 实验配置 | `sales-web/src/main/resources/db/migration/V1__experiments.sql` |
+| 埋点 API | `sales-web/src/main/java/org/example/web/tracking/` |
+| Flink 作业 | `flink-jobs/src/main/java/org/example/ab/EventAnalyticsJob.java` |
 | ClickHouse 表和摄入 | `docker/clickhouse/init/001_ab_analytics.sql` |
-| Dashboard 查询口径 | `sales-web/src/main/java/org/example/web/analytics/AnalyticsRepository.java` |
-
-阅读顺序建议：先看本文的全局架构和两条流转图，再根据关注点进入销售或 A/B 的具体实现。
+| Dashboard 与分钟指标查询 | `sales-web/src/main/java/org/example/web/analytics/AnalyticsRepository.java`、`sales-web/src/main/resources/static/ab-metrics-1m.html` |

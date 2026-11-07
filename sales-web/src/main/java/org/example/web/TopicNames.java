@@ -4,10 +4,6 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 @ConfigurationProperties(prefix = "app.topics")
 public record TopicNames(
-        String products,
-        String purchases,
-        String totals,
-        String enriched,
         String eventsRaw,
         String eventsValid,
         String eventsDlq,

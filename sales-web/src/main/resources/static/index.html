@@ -3,272 +3,83 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Flink Kafka 演示</title>
+  <title>A/B 测试演示</title>
   <style>
-    :root {
-      color-scheme: light;
-      --bg: #f3efe6;
-      --ink: #1d1a16;
-      --muted: #6d655c;
-      --line: #e2d9cc;
-      --card: #fffdf9;
-      --accent: #0d6b58;
-      --accent-ink: #ffffff;
-      --warn: #8a4b12;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
-      background: var(--bg);
-      color: var(--ink);
-    }
-    header, main { width: min(1100px, calc(100% - 32px)); margin: 0 auto; }
-    header { padding: 28px 0 8px; display: flex; justify-content: space-between; gap: 16px; align-items: end; }
-    h1 { margin: 0 0 6px; font-size: 28px; font-weight: 650; }
-    p { margin: 0; color: var(--muted); line-height: 1.5; }
-    a { color: var(--accent); }
-    main { display: grid; grid-template-columns: 320px 1fr; gap: 16px; padding: 16px 0 32px; }
-    section {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 16px;
-    }
-    h2 { margin: 0 0 12px; font-size: 16px; }
-    label { display: block; font-size: 13px; margin: 12px 0 6px; }
-    select, input[type="number"] {
-      width: 100%;
-      padding: 8px 10px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      font: inherit;
-    }
-    .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 14px; }
-    .actions { display: flex; gap: 8px; margin-top: 16px; }
-    button {
-      border: 0;
-      border-radius: 8px;
-      padding: 9px 12px;
-      font: inherit;
-      cursor: pointer;
-    }
-    button.primary { background: var(--accent); color: var(--accent-ink); }
-    button.ghost { background: #efe8dc; color: var(--ink); }
-    button:disabled { opacity: 0.55; cursor: default; }
-    .status { min-height: 1.4em; margin-top: 12px; font-size: 13px; color: var(--muted); }
-    .status.error { color: var(--warn); }
-    .stack { display: grid; gap: 16px; }
-    table { width: 100%; border-collapse: collapse; font-size: 14px; }
-    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-    th { color: var(--muted); font-weight: 600; font-size: 12px; }
-    tr.flash td { background: #e7f6f1; }
-    .empty { color: var(--muted); font-size: 14px; margin: 0; }
-    .meta { font-variant-numeric: tabular-nums; }
-    @media (max-width: 800px) {
-      main { grid-template-columns: 1fr; }
-    }
+    body { margin: 0; background: #f3efe6; color: #1d1a16; font-family: "Segoe UI", "PingFang SC", sans-serif; }
+    main { width: min(720px, calc(100% - 32px)); margin: 40px auto; }
+    .card { background: #fffdf9; border: 1px solid #e2d9cc; border-radius: 16px; padding: 24px; }
+    h1 { margin-top: 0; }
+    p { color: #6d655c; line-height: 1.6; }
+    .product { margin: 24px 0; padding: 20px; background: #f8f5ef; border-radius: 12px; }
+    button { border: 0; border-radius: 9px; padding: 11px 16px; color: white; cursor: pointer; font: inherit; }
+    button.secondary { background: #6d655c; margin-left: 8px; }
+    code { background: #efe8dc; padding: 2px 5px; border-radius: 4px; }
+    #status { min-height: 24px; margin-top: 18px; }
+    nav { margin-bottom: 16px; display: flex; gap: 14px; }
+    a { color: #0d6b58; }
   </style>
 </head>
 <body>
-  <header>
-    <div>
-      <h1>Flink Kafka 演示</h1>
-      <p>在这里发送购买记录。Flink 消费后，右侧会显示累计统计和关联结果。</p>
+<main>
+  <nav><a href="/ab-dashboard.html">实验 Dashboard</a><a href="/ab-metrics-1m.html">分钟指标</a></nav>
+  <div class="card">
+    <h1>A/B 测试演示</h1>
+    <p>当前用户：<code id="user">加载中</code>，版本：<code id="variant">分流中</code></p>
+    <div class="product">
+      <h2>流式数据课程</h2>
+      <p>价格 ¥99。按钮文案和颜色由实验版本 payload 决定。</p>
+      <button id="buy" disabled>加载实验</button>
+      <button id="reset" class="secondary">换一个用户</button>
     </div>
-    <p>
-      <a href="/ab-demo.html">A/B 演示</a> ·
-      <a href="/ab-dashboard.html">实验 Dashboard</a> ·
-      <a href="http://localhost:8081" target="_blank" rel="noreferrer">Flink 界面</a>
-    </p>
-  </header>
-  <main>
-    <section>
-      <h2>发送购买</h2>
-      <form id="purchase-form">
-        <label for="product">商品</label>
-        <select id="product" name="product_id"></select>
-        <label for="quantity">数量</label>
-        <input id="quantity" name="quantity" type="number" min="1" max="99" value="1" required>
-        <label class="check"><input id="member" type="checkbox"> 会员（九折）</label>
-        <div class="actions">
-          <button class="primary" type="submit">发送一条</button>
-          <button class="ghost" id="loop" type="button">连续发送</button>
-        </div>
-      </form>
-      <p class="status" id="status">正在连接 Kafka…</p>
-    </section>
-    <div class="stack">
-      <section>
-        <h2>累计统计</h2>
-        <p class="empty" id="totals-empty">还没有统计结果。发送一条购买后，这里会出现按商品累计的笔数、数量和销售额。</p>
-        <table id="totals" hidden>
-          <thead>
-            <tr>
-              <th>商品</th>
-              <th>笔数</th>
-              <th>数量</th>
-              <th>销售额</th>
-              <th>最近事件</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </section>
-      <section>
-        <h2>关联结果</h2>
-        <p class="empty" id="enriched-empty">购买记录和商品目录 join 之后，会出现在这里。</p>
-        <table id="enriched" hidden>
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>商品</th>
-              <th>数量</th>
-              <th>金额</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </section>
-    </div>
-  </main>
-  <script>
-    const productSelect = document.querySelector("#product");
-    const form = document.querySelector("#purchase-form");
-    const status = document.querySelector("#status");
-    const loopButton = document.querySelector("#loop");
-    const totalsTable = document.querySelector("#totals");
-    const totalsBody = totalsTable.querySelector("tbody");
-    const totalsEmpty = document.querySelector("#totals-empty");
-    const enrichedTable = document.querySelector("#enriched");
-    const enrichedBody = enrichedTable.querySelector("tbody");
-    const enrichedEmpty = document.querySelector("#enriched-empty");
-    let looping = false;
-    let loopTimer = null;
-    let previousTotals = new Map();
+    <p id="status"></p>
+  </div>
+</main>
+<script src="/sdk/ab-sdk.js"></script>
+<script>
+  const experimentKey = "checkout-button";
+  const buy = document.querySelector("#buy");
+  const status = document.querySelector("#status");
 
-    function setStatus(text, isError) {
-      status.textContent = text;
-      status.classList.toggle("error", Boolean(isError));
-    }
-
-    function payload() {
-      return {
-        product_id: productSelect.value,
-        quantity: Number(document.querySelector("#quantity").value),
-        is_member: document.querySelector("#member").checked
-      };
-    }
-
-    async function sendPurchase() {
-      const response = await fetch("/api/purchases", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload())
-      });
-      const body = await response.json();
-      if (!response.ok) {
-        throw new Error(body.detail || "发送失败");
-      }
-      setStatus(`已发送 ${body.product_name} × ${body.quantity}，交易号 ${body.transaction_id}`);
-    }
-
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      try {
-        await sendPurchase();
-      } catch (error) {
-        setStatus(error.message, true);
-      }
-    });
-
-    loopButton.addEventListener("click", () => {
-      looping = !looping;
-      loopButton.textContent = looping ? "停止发送" : "连续发送";
-      if (!looping) {
-        clearInterval(loopTimer);
+  async function boot() {
+    try {
+      AbSdk.init({});
+      document.querySelector("#user").textContent = AbSdk.userId;
+      const assignment = await AbSdk.getVariant(experimentKey);
+      if (!assignment.in_experiment) {
+        document.querySelector("#variant").textContent = "未进入实验";
+        status.textContent = "该用户未命中实验流量。";
         return;
       }
-      const tick = async () => {
-        try {
-          await sendPurchase();
-        } catch (error) {
-          looping = false;
-          loopButton.textContent = "连续发送";
-          clearInterval(loopTimer);
-          setStatus(error.message, true);
-        }
-      };
-      tick();
-      loopTimer = setInterval(tick, 1000);
-    });
-
-    function renderTotals(rows) {
-      const hasRows = rows.length > 0;
-      totalsTable.hidden = !hasRows;
-      totalsEmpty.hidden = hasRows;
-      totalsBody.replaceChildren();
-      for (const row of rows) {
-        const key = row.product_id;
-        const previous = previousTotals.get(key);
-        const tr = document.createElement("tr");
-        if (previous && previous !== String(row.transactions)) {
-          tr.className = "flash";
-        }
-        const name = row.product_name ? `${row.product_name} (${row.product_id})` : row.product_id;
-        [name, row.transactions ?? "", row.quantities ?? "", row.sales ?? "", row.event_time ?? ""].forEach((value, index) => {
-          const td = document.createElement("td");
-          if (index > 0) td.className = "meta";
-          td.textContent = value;
-          tr.append(td);
-        });
-        totalsBody.append(tr);
-        previousTotals.set(key, String(row.transactions));
-      }
+      document.querySelector("#variant").textContent = assignment.variant_key;
+      buy.textContent = assignment.payload.button_text || "购买";
+      buy.style.background = assignment.payload.button_color || "#0d6b58";
+      buy.disabled = false;
+      status.textContent = "曝光事件已发送。";
+    } catch (error) {
+      status.textContent = error.message;
     }
+  }
 
-    function renderEnriched(rows) {
-      const visible = rows.slice(0, 8);
-      const hasRows = visible.length > 0;
-      enrichedTable.hidden = !hasRows;
-      enrichedEmpty.hidden = hasRows;
-      enrichedBody.replaceChildren();
-      for (const row of visible) {
-        const tr = document.createElement("tr");
-        const name = row.product_name ? `${row.product_name} (${row.product_id})` : row.product_id;
-        [row.transaction_time ?? "", name, row.purchase_quantity ?? "", row.total_purchase ?? ""].forEach((value, index) => {
-          const td = document.createElement("td");
-          if (index !== 1) td.className = "meta";
-          td.textContent = value;
-          tr.append(td);
-        });
-        enrichedBody.append(tr);
-      }
+  buy.addEventListener("click", async () => {
+    buy.disabled = true;
+    try {
+      await AbSdk.track("click", { target: "buy_button" }, experimentKey);
+      await AbSdk.track("purchase", { amount: 99, product_id: "course-001" }, experimentKey);
+      status.textContent = "点击和购买事件已发送，稍后可在 Dashboard 查看。";
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      buy.disabled = false;
     }
+  });
 
-    async function refresh() {
-      const response = await fetch("/api/state");
-      const body = await response.json();
-      if (productSelect.options.length === 0) {
-        for (const product of body.products) {
-          const option = document.createElement("option");
-          option.value = product.product_id;
-          option.textContent = `${product.item} · ${product.price}`;
-          productSelect.append(option);
-        }
-      }
-      if (body.error) {
-        setStatus(body.error, true);
-      } else if (body.ready && status.textContent === "正在连接 Kafka…") {
-        setStatus("可以发送购买记录");
-      }
-      renderTotals(body.totals);
-      renderEnriched(body.enriched);
-    }
+  document.querySelector("#reset").addEventListener("click", () => {
+    localStorage.removeItem("ab_user_id");
+    sessionStorage.clear();
+    location.reload();
+  });
 
-    refresh();
-    setInterval(refresh, 1000);
-  </script>
+  boot();
+</script>
 </body>
 </html>

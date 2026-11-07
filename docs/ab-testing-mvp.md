@@ -1,13 +1,13 @@
 # 埋点与 A/B 测试 MVP
 
-这个 MVP 在原销售 Demo 旁边增加了一条独立链路：
+这条链路演示从分流到指标查询的完整 A/B 测试：
 
 ```text
 浏览器 SDK -> Spring Boot -> Kafka raw -> Flink -> Kafka valid/metrics -> ClickHouse
                            PostgreSQL 保存实验配置
 ```
 
-字段如何变化、Flink 如何去重和归因、ClickHouse 如何建表，可先看
+Kafka 和 Flink 在这条链路里各做什么、ClickHouse 如何自己消费 Kafka 落库、字段如何变化，可先看
 [数据模型与端到端数据流](data-model-and-flow.md)。
 
 ## 启动
@@ -23,9 +23,9 @@ Compose 会先启动 PostgreSQL、Kafka 和 ClickHouse，再启动 Web 与 Flink
 
 入口：
 
-- A/B 演示：<http://localhost:8088/ab-demo.html>
+- A/B 演示：<http://localhost:8088/ab-demo.html>（首页 <http://localhost:8088/> 相同）
 - 实验 Dashboard：<http://localhost:8088/ab-dashboard.html>
-- 原销售 Demo：<http://localhost:8088/>
+- 分钟指标：<http://localhost:8088/ab-metrics-1m.html>
 - Flink UI：<http://localhost:8081/>
 
 数据库：
@@ -102,7 +102,7 @@ curl -X POST http://localhost:8088/api/events \
 
 这里有两套不同粒度的指标：
 
-- `analytics.ab_metrics_1m` 中的 `exposures`、`clicks`、`purchases` 是一分钟窗口内的**事件条数**；
+- `analytics.ab_metrics_1m` 中的 `exposures`、`clicks`、`purchases` 是一分钟窗口内的**事件条数**。分钟指标页读取这张表。
 - Dashboard API 不读取分钟表，而是从 `analytics.ab_events FINAL` 计算曝光、点击和购买**用户数**，再计算 CTR 与转化率。
 
 因此分钟表中的 `clicks` 不能直接与 Dashboard 的“点击用户数”比较。A/B Flink

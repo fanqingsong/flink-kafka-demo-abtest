@@ -9,26 +9,6 @@ import org.springframework.kafka.config.TopicBuilder;
 public class KafkaSetup {
 
     @Bean
-    public NewTopic productsTopic(TopicNames topics) {
-        return topic(topics.products());
-    }
-
-    @Bean
-    public NewTopic purchasesTopic(TopicNames topics) {
-        return topic(topics.purchases());
-    }
-
-    @Bean
-    public NewTopic totalsTopic(TopicNames topics) {
-        return topic(topics.totals());
-    }
-
-    @Bean
-    public NewTopic enrichedTopic(TopicNames topics) {
-        return topic(topics.enriched());
-    }
-
-    @Bean
     public NewTopic eventsRawTopic(TopicNames topics) {
         return eventTopic(topics.eventsRaw());
     }
@@ -46,10 +26,6 @@ public class KafkaSetup {
     @Bean
     public NewTopic metricsTopic(TopicNames topics) {
         return eventTopic(topics.metrics());
-    }
-
-    private static NewTopic topic(String name) {
-        return TopicBuilder.name(name).partitions(1).replicas(1).build();
     }
 
     private static NewTopic eventTopic(String name) {

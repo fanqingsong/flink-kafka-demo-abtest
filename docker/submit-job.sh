@@ -3,8 +3,6 @@ set -euo pipefail
 
 MAIN_CLASS="${1:?usage: submit-job.sh <main class>}"
 case "$MAIN_CLASS" in
-  org.example.RunningTotals) JOB_NAME="Flink Running Totals Demo" ;;
-  org.example.JoinStreams) JOB_NAME="Flink Streaming Join Demo" ;;
   org.example.ab.EventAnalyticsJob) JOB_NAME="Flink AB Event Analytics" ;;
   *) JOB_NAME="$MAIN_CLASS" ;;
 esac

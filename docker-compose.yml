@@ -139,7 +139,7 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
-        taskmanager.numberOfTaskSlots: 4
+        taskmanager.numberOfTaskSlots: 2
         parallelism.default: 1
         execution.checkpointing.interval: 30s
         execution.checkpointing.mode: EXACTLY_ONCE
@@ -149,40 +149,6 @@ services:
     depends_on:
       jobmanager:
         condition: service_healthy
-
-  running-totals:
-    image: flink-kafka-demo-job
-    build: .
-    command: ["org.example.RunningTotals"]
-    environment:
-      BOOTSTRAP_SERVERS: kafka:29092
-    depends_on:
-      kafka:
-        condition: service_healthy
-      web:
-        condition: service_healthy
-      jobmanager:
-        condition: service_healthy
-      taskmanager:
-        condition: service_started
-    restart: "no"
-
-  join-streams:
-    image: flink-kafka-demo-job
-    build: .
-    command: ["org.example.JoinStreams"]
-    environment:
-      BOOTSTRAP_SERVERS: kafka:29092
-    depends_on:
-      kafka:
-        condition: service_healthy
-      web:
-        condition: service_healthy
-      jobmanager:
-        condition: service_healthy
-      taskmanager:
-        condition: service_started
-    restart: "no"
 
   event-analytics:
     image: flink-kafka-demo-job

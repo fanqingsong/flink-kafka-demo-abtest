@@ -16,40 +16,36 @@ Kafka 是埋点消息总线，把接入、计算和存储拆开。Web 把原始�
 `event-analytics` 用 `flink run -d` 提交作业后退出，作业继续在 TaskManager 上运行。
 
 ```mermaid
-flowchart TB
+%%{init: {"flowchart": {"curve": "bumpX", "nodeSpacing": 36, "rankSpacing": 64}}}%%
+flowchart LR
   browser["Browser"]
   web["web :8088<br/>分流、写入埋点、查询指标"]
-
-  subgraph kafka["Kafka 3.7 KRaft"]
-    direction LR
-    raw["ab.events.raw"]
-    valid["ab.events.valid"]
-    dlq["ab.events.dlq"]
-    metrics["ab.metrics.1m"]
-  end
-
-  subgraph flink["Flink 1.19.1"]
-    jm["JobManager :8081"]
-    tm["TaskManager"]
-    job["EventAnalyticsJob"]
-  end
-
   pg[("PostgreSQL<br/>实验配置")]
+
+  raw["Kafka 3.7 KRaft<br/>ab.events.raw"]
+  valid["Kafka 3.7 KRaft<br/>ab.events.valid"]
+  metrics["Kafka 3.7 KRaft<br/>ab.metrics.1m"]
+  dlq["Kafka 3.7 KRaft<br/>ab.events.dlq"]
+
+  jm["Flink JobManager<br/>:8081"]
+  tm["Flink TaskManager"]
+  job["Flink<br/>EventAnalyticsJob"]
+
   ch[("ClickHouse<br/>事件与分钟指标")]
 
   browser -->|"localhost:8088"| web
   browser -->|"localhost:8081"| jm
   web --> pg
-  web -->|"埋点"| raw
-  web --> ch
-  raw --> job
-  job --> valid
-  job --> dlq
-  job --> metrics
-  valid --> ch
-  metrics --> ch
+  web -->|"写入埋点"| raw
   jm --> tm
   tm --> job
+  raw --> job
+  job -->|"有效事件"| valid
+  job -->|"分钟指标"| metrics
+  job -->|"校验失败"| dlq
+  valid --> ch
+  metrics --> ch
+  web -.->|"查询指标"| ch
 ```
 
 | 组件 | 生命周期 | 作用 |
